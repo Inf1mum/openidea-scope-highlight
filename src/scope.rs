@@ -266,13 +266,58 @@ fn find_tag_closer(
     None
 }
 
+/// Scans backward for the `<name …>` opener matching the `</name>` closer at
+/// `from` (the closer's `<`). Returns the opener's `<` and one past its `>`.
+/// The mirror of [`find_tag_closer`]: nested same-name closers count up, their
+/// openers count back down, and other names, self-closers and plain brackets
+/// do not affect the depth.
+fn find_tag_opener(
+    units: &[u16],
+    from: usize,
+    limit: usize,
+    name: (usize, usize),
+) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i > limit {
+        i -= 1;
+        if units[i] == GT {
+            match parse_tag_backwards(units, i, limit) {
+                TagBack::Closer { lt, name: n } => {
+                    if same_name(units, n, name) {
+                        depth += 1;
+                    }
+                    i = lt;
+                }
+                TagBack::Opener {
+                    lt,
+                    name: n,
+                    self_closing,
+                } => {
+                    if !self_closing && same_name(units, n, name) {
+                        if depth == 0 {
+                            return Some((lt, i + 1));
+                        }
+                        depth -= 1;
+                    }
+                    i = lt;
+                }
+                TagBack::None => {}
+            }
+        }
+    }
+    None
+}
+
 /// Finds the innermost pair enclosing `caret` (a UTF-16 offset into `units`).
 ///
 /// Scanning backwards from the caret, closers stack up and matched openers pop
 /// them; an opener that does not close before the caret encloses it. Candidates
 /// are tried innermost first, and an opener whose closer is not found within
 /// the bound is skipped, so one stray unmatched bracket does not hide the scope
-/// around it.
+/// around it. A tag token that contains the caret (its `>` is ahead of it) is
+/// the candidate pair's own end: an opener pairs forward, a closer pairs
+/// backward, so the caret inside `</div>` highlights that div.
 pub fn find_enclosing(units: &[u16], caret: usize) -> Option<Pair> {
     let caret = caret.min(units.len());
     let back_limit = caret.saturating_sub(MAX_SCAN);
@@ -357,13 +402,13 @@ pub fn find_enclosing(units: &[u16], caret: usize) -> Option<Pair> {
                 }
                 TagBack::None => {}
             },
-            // A tag whose `>` is still ahead of the caret (the caret sits in the
-            // tag itself, say on an attribute): the opener starts here. An opener
-            // that already ended before the caret was handled at its `>`.
-            LT => {
-                if let Some(TagFwd::Opener { end, name }) = parse_tag_forward(units, i, fwd_limit)
-                    && end > caret
-                {
+            // A tag whose `>` is still ahead of the caret: the caret sits in
+            // the token itself. An opener that already ended before the caret
+            // was handled at its `>`; a closer is handled at its `<` below.
+            LT => match parse_tag_forward(units, i, fwd_limit) {
+                // The caret sits in an opening tag, say on an attribute: the
+                // pair is this opener with whichever closer follows the caret.
+                Some(TagFwd::Opener { end, name }) if end > caret => {
                     if matches!(stack.last(), Some(&Kind::Tag(ns, ne)) if same_name(units, (ns, ne), name))
                     {
                         stack.pop();
@@ -378,7 +423,20 @@ pub fn find_enclosing(units: &[u16], caret: usize) -> Option<Pair> {
                         });
                     }
                 }
-            }
+                // The caret sits inside `</name>`: that closer ends the
+                // enclosing pair, whose opener lies before it.
+                Some(TagFwd::Closer { end, name }) if end > caret => {
+                    if let Some((lt, opener_end)) = find_tag_opener(units, i, back_limit, name) {
+                        return Some(Pair {
+                            start: lt,
+                            opener_end,
+                            closer_start: i,
+                            end,
+                        });
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -576,6 +634,63 @@ mod tests {
         let text = "<div class=\"a\">hi</div>";
         // Caret inside the attribute: the div still encloses it.
         let at = text.find("class").unwrap();
+        assert_eq!(enclosing(text, at), Some((0, text.len())));
+    }
+
+    #[test]
+    fn caret_inside_an_opening_tag_finds_that_pair() {
+        // Inside the opener's name and inside its attribute: the span is the
+        // scope, not the outer div.
+        let text = "<div><span lang=\"en\">x</span></div>";
+        for marker in ["span", "lang"] {
+            let at = text.find(marker).unwrap();
+            assert_eq!(
+                enclosing(text, at),
+                Some((5, text.rfind("</span>").unwrap() + 7)),
+                "caret inside {marker}"
+            );
+        }
+        // A self-closing tag is no pair: the enclosing div is the scope.
+        let text = "<div><img src=\"x\" />hi</div>";
+        let at = text.find("src").unwrap();
+        assert_eq!(enclosing(text, at), Some((0, text.len())));
+    }
+
+    #[test]
+    fn caret_inside_a_closing_tag_finds_that_pair() {
+        // The caret within `</span>`'s name: the span pair encloses it (its
+        // opener at column 5), not the outer div (column 0).
+        let text = "<div><span>x</span></div>";
+        for at in [13, 14, 16, 18] {
+            assert_eq!(enclosing(text, at), Some((5, 19)), "caret at {at}");
+        }
+        // The enclosing-parent control: inside `</div>` the div is the scope.
+        for at in [20, 22, 24] {
+            assert_eq!(enclosing(text, at), Some((0, 25)), "caret at {at}");
+        }
+        // The closer may sit lines below its opener.
+        let text = "<div>\n  <span>x\n  </span>\n</div>\n";
+        let at = text.find("</span>").unwrap() + 4;
+        assert_eq!(
+            enclosing(text, at),
+            Some((
+                text.find("<span").unwrap(),
+                text.find("</span>").unwrap() + 7
+            ))
+        );
+    }
+
+    #[test]
+    fn nested_closing_tags_pick_the_innermost_pair() {
+        let text = "<div><span><span>x</span>mid</span></div>";
+        // Inside the inner closer's name: the inner span.
+        let at = text.find("</span>").unwrap() + 3;
+        assert_eq!(enclosing(text, at), Some((11, 25)));
+        // Inside the outer closer: the outer span.
+        let at = text.find("mid").unwrap() + 4;
+        assert_eq!(enclosing(text, at), Some((5, 35)));
+        // Inside the div's closer: the div.
+        let at = text.rfind("</div>").unwrap() + 2;
         assert_eq!(enclosing(text, at), Some((0, text.len())));
     }
 
