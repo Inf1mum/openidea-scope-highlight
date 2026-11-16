@@ -122,15 +122,48 @@ fn active_paths() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether `event_path` names the document recorded at `stored` (an absolute
-/// path). The event may name it project-relative, with either separator.
-fn same_document(stored: &str, event_path: &str) -> bool {
-    let stored = stored.replace('\\', "/");
-    let event = event_path.replace('\\', "/");
-    stored == event
-        || (stored.len() > event.len()
-            && stored.ends_with(&event)
-            && stored.as_bytes()[stored.len() - event.len() - 1] == b'/')
+/// Separator-normalized, so Windows and Unix spellings compare equal.
+fn normalize(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Whether `path` is absolute (`/…` or `C:/…`).
+fn is_absolute(path: &str) -> bool {
+    path.starts_with('/')
+        || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/'))
+}
+
+/// The document a change event names, as an absolute path. The host delivers
+/// the path project-relative, so the match is scoped to the invoking window:
+/// its editor is the changed document (its absolute path ends with the
+/// event's relative one), and otherwise the window's project root resolves
+/// the relative path. Absolute event paths match directly. `None` for
+/// anything that cannot be pinned to one document, so no wrong record is
+/// cleared: two projects can hold the same relative path.
+fn resolve_event_path(
+    event_path: &str,
+    editor_path: Option<&str>,
+    root: Option<&str>,
+) -> Option<String> {
+    let event = normalize(event_path);
+    if is_absolute(&event) {
+        return Some(event);
+    }
+    // A relative path must stay inside its project.
+    if event.split('/').any(|part| part == "..") {
+        return None;
+    }
+    if let Some(editor) = editor_path.map(normalize) {
+        let ends_with_event = editor.len() > event.len()
+            && editor.ends_with(&event)
+            && editor.as_bytes()[editor.len() - event.len() - 1] == b'/';
+        if is_absolute(&editor) && ends_with_event {
+            return Some(editor);
+        }
+    }
+    let root = normalize(root?);
+    let root = root.trim_end_matches('/');
+    Some(format!("{root}/{event}"))
 }
 
 /// Forgets one painted document.
@@ -169,16 +202,26 @@ impl Plugin for ScopeHighlight {
         }
     }
 
-    fn handle_events(&mut self, events: &[Event], _ctx: &Invocation) {
+    fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
+        // The host delivers change paths project-relative, so the document is
+        // resolved within the invoking window before matching: a bare match
+        // over every stored path would clear another project's record and
+        // leave this one stale.
+        let editor = ctx.editor().map(|editor| editor.path());
+        let root = ctx.project().and_then(|project| project.root().ok());
         for event in events {
             if let Event::DocumentChanged(change) = event
+                && let Some(document) =
+                    resolve_event_path(&change.path, editor.as_deref(), root.as_deref())
                 && let Some(stored) = active_paths()
                     .into_iter()
-                    .find(|p| same_document(p, &change.path))
+                    .find(|p| normalize(p) == document)
             {
-                // Edits clear stale ranges: the file's own set empties.
-                let _ = host::set_decorations(&stored, SET, &[]);
-                forget_path(&stored);
+                // Edits clear stale ranges: the file's own set empties. The
+                // record stays when the clear fails, so a later edit retries.
+                if host::set_decorations(&stored, SET, &[]).is_ok() {
+                    forget_path(&stored);
+                }
             }
         }
     }
@@ -388,6 +431,81 @@ mod tests {
     }
 
     #[test]
+    fn dim_at_a_caret_inside_a_closing_tag_marks_that_pair() {
+        let mock = MockHost::install();
+        mock.add_project("/project");
+        // The caret inside `</p>`'s name: the p pair is the scope — its
+        // opener at column 5, not the outer div at column 0.
+        mock.open_editor(
+            "/project/index.html",
+            "html",
+            "<div><p>hi</p></div>",
+            &[(0, 12, 0, 12)],
+        );
+        let mut plugin = ScopeHighlight;
+        plugin.run_command("dim", &mock.invocation(), None).unwrap();
+        let items = &mock.decorations()[&set_key("/project/index.html")];
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].style, "muted");
+        assert_eq!(
+            items[0].range,
+            Range::new(
+                Position {
+                    line: 0,
+                    character: 0
+                },
+                Position {
+                    line: 0,
+                    character: 5
+                }
+            ),
+            "muted up to the p opener, not the div-only pair at column 0"
+        );
+        assert_eq!(items[1].style, "muted");
+        assert_eq!(
+            items[1].range,
+            Range::new(
+                Position {
+                    line: 0,
+                    character: 14
+                },
+                Position {
+                    line: 0,
+                    character: 20
+                }
+            )
+        );
+        assert_eq!(items[2].style, "highlight");
+        assert_eq!(
+            items[2].range,
+            Range::new(
+                Position {
+                    line: 0,
+                    character: 5
+                },
+                Position {
+                    line: 0,
+                    character: 8
+                }
+            )
+        );
+        assert_eq!(items[3].style, "highlight");
+        assert_eq!(
+            items[3].range,
+            Range::new(
+                Position {
+                    line: 0,
+                    character: 10
+                },
+                Position {
+                    line: 0,
+                    character: 14
+                }
+            )
+        );
+    }
+
+    #[test]
     fn clear_removes_every_scope() {
         let mock = MockHost::install();
         mock.add_project("/project");
@@ -505,13 +623,123 @@ mod tests {
     }
 
     #[test]
-    fn paths_match_across_separators_and_prefixes() {
-        assert!(same_document("/p/a.txt", "/p/a.txt"));
-        assert!(same_document("/p/a.txt", "a.txt"));
-        assert!(same_document("C:\\p\\a.txt", "a.txt"));
-        assert!(same_document("C:\\p\\a.txt", "p/a.txt"));
-        assert!(same_document("/p/a/b.txt", "a/b.txt"));
-        assert!(!same_document("/p/a.txt", "b.txt"));
-        assert!(!same_document("/p/xa.txt", "a.txt"));
+    fn event_paths_resolve_within_the_invoking_window() {
+        // Absolute event paths match directly.
+        assert_eq!(
+            resolve_event_path("/p/a.txt", None, Some("/q")),
+            Some("/p/a.txt".into())
+        );
+        // The invoking window's editor is the changed document: its absolute
+        // path ends with the event's relative one, on a path boundary.
+        assert_eq!(
+            resolve_event_path("a.txt", Some("/p/a.txt"), None),
+            Some("/p/a.txt".into())
+        );
+        assert_eq!(
+            resolve_event_path("a/b.txt", Some("C:\\p\\a\\b.txt"), None),
+            Some("C:/p/a/b.txt".into())
+        );
+        // Not on a boundary, or another document: the root decides.
+        assert_eq!(
+            resolve_event_path("a.txt", Some("/p/xa.txt"), Some("/p")),
+            Some("/p/a.txt".into())
+        );
+        assert_eq!(
+            resolve_event_path("a.txt", Some("/p/b.txt"), Some("/p")),
+            Some("/p/a.txt".into())
+        );
+        // Without an editor the window's project root resolves the path.
+        assert_eq!(
+            resolve_event_path("a.txt", None, Some("/p")),
+            Some("/p/a.txt".into())
+        );
+        assert_eq!(
+            resolve_event_path("a.txt", None, Some("C:\\p\\")),
+            Some("C:/p/a.txt".into())
+        );
+        // A relative path with neither editor nor root, or one escaping its
+        // root, matches nothing.
+        assert_eq!(resolve_event_path("a.txt", None, None), None);
+        assert_eq!(
+            resolve_event_path("../a.txt", Some("/p/a.txt"), Some("/p")),
+            None
+        );
+    }
+
+    #[test]
+    fn identical_relative_paths_in_two_projects_clear_only_the_edited_one() {
+        let mock = MockHost::install();
+        mock.add_project("/one");
+        mock.add_project("/two");
+        let mut plugin = ScopeHighlight;
+        // Paint /one/src/main.rs in /one's window…
+        mock.set_project_root(Some("/one"));
+        mock.open_editor(
+            "/one/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![1];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        // …and /two/src/main.rs in /two's window.
+        mock.set_project_root(Some("/two"));
+        mock.open_editor(
+            "/two/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![2];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        assert_eq!(mock.decorations()[&set_key("/one/src/main.rs")].len(), 1);
+        assert_eq!(mock.decorations()[&set_key("/two/src/main.rs")].len(), 1);
+        // An edit in /two's window arrives with the project-relative path both
+        // projects share: it must clear /two's scope, not /one's.
+        plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
+        assert!(mock.decorations()[&set_key("/two/src/main.rs")].is_empty());
+        assert_eq!(
+            mock.decorations()[&set_key("/one/src/main.rs")].len(),
+            1,
+            "the other project's scope survives"
+        );
+        // The forgotten record is /two's; /one's stays for a later edit.
+        assert_eq!(mock.storage()[ACTIVE_KEY].lines().count(), 1);
+        assert!(mock.storage()[ACTIVE_KEY].contains("/one/src/main.rs"));
+        // The same event from /one's window clears /one's scope.
+        mock.set_project_root(Some("/one"));
+        mock.open_editor(
+            "/one/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![1];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
+        assert!(mock.decorations()[&set_key("/one/src/main.rs")].is_empty());
+        assert!(!mock.storage().contains_key(ACTIVE_KEY));
+    }
+
+    #[test]
+    fn a_failed_clear_keeps_the_record() {
+        let mock = MockHost::install();
+        mock.add_project("/project");
+        mock.open_editor("/project/a.txt", "", "(x)", &[(0, 1, 0, 1)]);
+        let mut plugin = ScopeHighlight;
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        assert_eq!(mock.decorations()[&set_key("/project/a.txt")].len(), 1);
+        // The clear fails (the invocation names no project), so the record
+        // must stay: a later edit can still clear the stale ranges.
+        mock.set_project_root(None);
+        plugin.handle_events(&[changed("/project/a.txt")], &mock.invocation());
+        assert_eq!(mock.storage()[ACTIVE_KEY], "/project/a.txt");
+        // With the project back, the next edit clears the document.
+        mock.set_project_root(Some("/project"));
+        plugin.handle_events(&[changed("/project/a.txt")], &mock.invocation());
+        assert!(mock.decorations()[&set_key("/project/a.txt")].is_empty());
+        assert!(!mock.storage().contains_key(ACTIVE_KEY));
     }
 }
