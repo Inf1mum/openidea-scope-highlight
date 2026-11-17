@@ -134,12 +134,16 @@ fn is_absolute(path: &str) -> bool {
 }
 
 /// The document a change event names, as an absolute path. The host delivers
-/// the path project-relative, so the match is scoped to the invoking window:
-/// its editor is the changed document (its absolute path ends with the
-/// event's relative one), and otherwise the window's project root resolves
-/// the relative path. Absolute event paths match directly. `None` for
-/// anything that cannot be pinned to one document, so no wrong record is
-/// cleared: two projects can hold the same relative path.
+/// the path project-relative, so the match is scoped to the invoking window.
+/// The window's project root resolves a relative path: it is the proven
+/// identity, because the host queues a batch for up to 500 ms and names it
+/// with the editor focused at flush time, which a delayed batch may not be
+/// the changed document (its path can still end with the event's relative
+/// one). Only without a root does the focused editor's absolute path serve,
+/// as the remaining identity, when it ends with the event's relative one on
+/// a path boundary. Absolute event paths match directly. `None` for anything
+/// that cannot be pinned to one document, so no wrong record is cleared: two
+/// projects can hold the same relative path.
 fn resolve_event_path(
     event_path: &str,
     editor_path: Option<&str>,
@@ -153,17 +157,18 @@ fn resolve_event_path(
     if event.split('/').any(|part| part == "..") {
         return None;
     }
-    if let Some(editor) = editor_path.map(normalize) {
-        let ends_with_event = editor.len() > event.len()
-            && editor.ends_with(&event)
-            && editor.as_bytes()[editor.len() - event.len() - 1] == b'/';
-        if is_absolute(&editor) && ends_with_event {
-            return Some(editor);
-        }
+    if let Some(root) = root.map(normalize) {
+        let root = root.trim_end_matches('/');
+        return Some(format!("{root}/{event}"));
     }
-    let root = normalize(root?);
-    let root = root.trim_end_matches('/');
-    Some(format!("{root}/{event}"))
+    let editor = normalize(editor_path?);
+    let ends_with_event = editor.len() > event.len()
+        && editor.ends_with(&event)
+        && editor.as_bytes()[editor.len() - event.len() - 1] == b'/';
+    if is_absolute(&editor) && ends_with_event {
+        return Some(editor);
+    }
+    None
 }
 
 /// Forgets one painted document.
@@ -206,7 +211,9 @@ impl Plugin for ScopeHighlight {
         // The host delivers change paths project-relative, so the document is
         // resolved within the invoking window before matching: a bare match
         // over every stored path would clear another project's record and
-        // leave this one stale.
+        // leave this one stale. The window's project root decides — the
+        // focused editor is only a fallback, since a batch flushed late names
+        // whatever editor the user has focused, not the changed document.
         let editor = ctx.editor().map(|editor| editor.path());
         let root = ctx.project().and_then(|project| project.root().ok());
         for event in events {
@@ -648,6 +655,14 @@ mod tests {
             resolve_event_path("a.txt", Some("/p/b.txt"), Some("/p")),
             Some("/p/a.txt".into())
         );
+        // The root decides even when the focused editor's path happens to end
+        // with the event's relative one: a batch flushed after a switch names
+        // the focused editor, not the changed document (the root is the
+        // proven identity, the suffix match is not).
+        assert_eq!(
+            resolve_event_path("src/main.rs", Some("/p/other/src/main.rs"), Some("/p")),
+            Some("/p/src/main.rs".into())
+        );
         // Without an editor the window's project root resolves the path.
         assert_eq!(
             resolve_event_path("a.txt", None, Some("/p")),
@@ -719,6 +734,55 @@ mod tests {
         plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
         assert!(mock.decorations()[&set_key("/one/src/main.rs")].is_empty());
         assert!(!mock.storage().contains_key(ACTIVE_KEY));
+    }
+
+    #[test]
+    fn a_delayed_batch_clears_the_changed_document_not_the_focused_one() {
+        let mock = MockHost::install();
+        mock.add_project("/project");
+        let mut plugin = ScopeHighlight;
+        // Paint /project/src/main.rs…
+        mock.open_editor(
+            "/project/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![1];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        // …and /project/other/src/main.rs, whose path ends with the same
+        // project-relative name the first file's events carry.
+        mock.open_editor(
+            "/project/other/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![2];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        assert_eq!(mock.decorations()[&set_key("/project/src/main.rs")].len(), 1);
+        assert_eq!(
+            mock.decorations()[&set_key("/project/other/src/main.rs")].len(),
+            1
+        );
+        // The batch is delayed past an editor switch: the host queues events
+        // for up to 500 ms and takes the focused editor at flush time, so the
+        // edit to src/main.rs arrives while other/src/main.rs is focused. The
+        // event still names src/main.rs relative to the window's root.
+        plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
+        assert!(
+            mock.decorations()[&set_key("/project/src/main.rs")].is_empty(),
+            "the edited document's stale ranges are cleared"
+        );
+        assert_eq!(
+            mock.decorations()[&set_key("/project/other/src/main.rs")].len(),
+            1,
+            "the focused document's unrelated scope survives"
+        );
+        // Only the edited file's record is forgotten.
+        assert_eq!(mock.storage()[ACTIVE_KEY], "/project/other/src/main.rs");
     }
 
     #[test]
