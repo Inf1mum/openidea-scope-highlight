@@ -1,6 +1,6 @@
 id = "inf1mum.scope-highlight"
 name = "Scope Highlight"
-version = "0.1.1"
+version = "0.1.2"
 description = "Highlight the innermost enclosing bracket or tag pair at the caret, or dim everything outside it. Clears on Escape, document edits, or the Clear command."
 authors = ["Inf1mum"]
 license = "MIT"
