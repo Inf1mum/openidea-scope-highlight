@@ -134,16 +134,22 @@ fn is_absolute(path: &str) -> bool {
 }
 
 /// The document a change event names, as an absolute path. The host delivers
-/// the path project-relative, so the match is scoped to the invoking window.
-/// The window's project root resolves a relative path: it is the proven
-/// identity, because the host queues a batch for up to 500 ms and names it
-/// with the editor focused at flush time, which a delayed batch may not be
-/// the changed document (its path can still end with the event's relative
-/// one). Only without a root does the focused editor's absolute path serve,
-/// as the remaining identity, when it ends with the event's relative one on
-/// a path boundary. Absolute event paths match directly. `None` for anything
-/// that cannot be pinned to one document, so no wrong record is cleared: two
-/// projects can hold the same relative path.
+/// the path project-relative — against the file's own project, not necessarily
+/// the invoking window's — so the match is scoped to one document. Two
+/// identities can pin it, and when both are present the window's tree decides
+/// which one was the event's root: a focused editor inside the window's tree
+/// leaves the root in charge, because the host queues a batch for up to 500 ms
+/// and names it with the editor focused at flush time, which a delayed batch
+/// may not be the changed document (its path can still end with the event's
+/// relative one). A focused editor outside the window's tree names the changed
+/// document itself — the window's root cannot have produced a path of a file
+/// it does not contain — taken when it ends with the event's relative one on
+/// a path boundary; the root stays in charge when that suffix does not match,
+/// since the batch still belongs to the window. Without an editor the root
+/// resolves the path; without a root the suffix-matching editor serves as the
+/// remaining identity. Absolute event paths match directly. `None` for
+/// anything that cannot be pinned to one document, so no wrong record is
+/// cleared: two projects can hold the same relative path.
 fn resolve_event_path(
     event_path: &str,
     editor_path: Option<&str>,
@@ -157,18 +163,40 @@ fn resolve_event_path(
     if event.split('/').any(|part| part == "..") {
         return None;
     }
-    if let Some(root) = root.map(normalize) {
-        let root = root.trim_end_matches('/');
-        return Some(format!("{root}/{event}"));
+    // The focused editor, when its absolute path ends with the event's
+    // relative one on a path boundary.
+    let editor = editor_path.map(normalize).filter(|editor| {
+        is_absolute(editor)
+            && editor.len() > event.len()
+            && editor.ends_with(&event)
+            && editor.as_bytes()[editor.len() - event.len() - 1] == b'/'
+    });
+    let root = root.map(normalize).map(|root| root.trim_end_matches('/').to_owned());
+    match (root, editor) {
+        (Some(root), Some(editor)) => {
+            if is_inside_root(&editor, &root) {
+                // One window's batch: the root is the proven identity — the
+                // suffix match may name a file the user focused afterwards.
+                Some(format!("{root}/{event}"))
+            } else {
+                // A foreign editor: the window's root is not this event's
+                // project, the editor names the changed document.
+                Some(editor)
+            }
+        }
+        (Some(root), None) => Some(format!("{root}/{event}")),
+        (None, Some(editor)) => Some(editor),
+        (None, None) => None,
     }
-    let editor = normalize(editor_path?);
-    let ends_with_event = editor.len() > event.len()
-        && editor.ends_with(&event)
-        && editor.as_bytes()[editor.len() - event.len() - 1] == b'/';
-    if is_absolute(&editor) && ends_with_event {
-        return Some(editor);
-    }
-    None
+}
+
+/// Whether `path` lies inside `root` (its own tree, not a sibling directory
+/// that merely shares a prefix, like `/proj` of `/project`).
+fn is_inside_root(path: &str, root: &str) -> bool {
+    path == root
+        || (path.len() > root.len()
+            && path.starts_with(root)
+            && path.as_bytes()[root.len()] == b'/')
 }
 
 /// Forgets one painted document.
@@ -209,11 +237,13 @@ impl Plugin for ScopeHighlight {
 
     fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
         // The host delivers change paths project-relative, so the document is
-        // resolved within the invoking window before matching: a bare match
-        // over every stored path would clear another project's record and
-        // leave this one stale. The window's project root decides — the
-        // focused editor is only a fallback, since a batch flushed late names
-        // whatever editor the user has focused, not the changed document.
+        // resolved to one absolute path before matching: a bare match over
+        // every stored path would clear another project's record and leave
+        // this one stale. Inside the window's tree the project root decides —
+        // a batch flushed late names whatever editor the user has focused,
+        // not the changed document; a focused editor outside the tree is the
+        // foreign document itself, since the host relativizes against the
+        // file's own project, not the window's.
         let editor = ctx.editor().map(|editor| editor.path());
         let root = ctx.project().and_then(|project| project.root().ok());
         for event in events {
@@ -658,10 +688,32 @@ mod tests {
         // The root decides even when the focused editor's path happens to end
         // with the event's relative one: a batch flushed after a switch names
         // the focused editor, not the changed document (the root is the
-        // proven identity, the suffix match is not).
+        // proven identity, the suffix match is not). The editor belongs to
+        // the window's tree, so the window's root is in charge.
         assert_eq!(
             resolve_event_path("src/main.rs", Some("/p/other/src/main.rs"), Some("/p")),
             Some("/p/src/main.rs".into())
+        );
+        // A focused editor outside the window's tree, ending with the event's
+        // relative path: the host relativizes a change against its file's own
+        // project, so a matching document the root does not contain names
+        // itself — the window's root is not this event's project.
+        assert_eq!(
+            resolve_event_path("src/main.rs", Some("/two/src/main.rs"), Some("/one")),
+            Some("/two/src/main.rs".into())
+        );
+        // The same foreign editor that does not end with the event's relative
+        // path pins nothing: the batch still belongs to the window, the root
+        // resolves the path.
+        assert_eq!(
+            resolve_event_path("a.txt", Some("/two/src/main.rs"), Some("/one")),
+            Some("/one/a.txt".into())
+        );
+        // Inside vs outside the tree is not a string-prefix accident: a
+        // sibling directory sharing a prefix is outside.
+        assert_eq!(
+            resolve_event_path("src/main.rs", Some("/project/src/main.rs"), Some("/proj")),
+            Some("/project/src/main.rs".into())
         );
         // Without an editor the window's project root resolves the path.
         assert_eq!(
@@ -734,6 +786,67 @@ mod tests {
         plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
         assert!(mock.decorations()[&set_key("/one/src/main.rs")].is_empty());
         assert!(!mock.storage().contains_key(ACTIVE_KEY));
+    }
+
+    #[test]
+    fn a_foreign_project_edit_clears_the_edited_document_not_the_window_root_s() {
+        let mock = MockHost::install();
+        mock.add_project("/one");
+        mock.add_project("/two");
+        let mut plugin = ScopeHighlight;
+        // Paint /one/src/main.rs in /one's window…
+        mock.set_project_root(Some("/one"));
+        mock.open_editor(
+            "/one/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![1];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        // …and /two/src/main.rs in /two's window.
+        mock.set_project_root(Some("/two"));
+        mock.open_editor(
+            "/two/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![2];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin
+            .run_command("highlight", &mock.invocation(), None)
+            .unwrap();
+        assert_eq!(mock.decorations()[&set_key("/one/src/main.rs")].len(), 1);
+        assert_eq!(mock.decorations()[&set_key("/two/src/main.rs")].len(), 1);
+        // A foreign-project delivery: the host relativizes a change against
+        // its file's own project, so /two's edit arrives as `src/main.rs`
+        // while the invoking window's project is /one and /two/src/main.rs is
+        // the focused editor. The window root must not turn the event into
+        // /one/src/main.rs: the edited document is /two's, so /one's scope
+        // survives untouched. (The mock scopes `set_decorations` to the
+        // invocation's project, unlike the released host, which follows the
+        // file — so the /two clear itself lands in the resolution-rules test
+        // above, and here the assertion is the wrong clear that must not
+        // happen.)
+        mock.set_project_root(Some("/one"));
+        mock.open_editor(
+            "/two/src/main.rs",
+            "rust",
+            "fn main() {\n    let v = vec![2];\n}\n",
+            &[(1, 17, 1, 17)],
+        );
+        plugin.handle_events(&[changed("src/main.rs")], &mock.invocation());
+        assert_eq!(
+            mock.decorations()[&set_key("/one/src/main.rs")].len(),
+            1,
+            "the window root's same-named file is not a match for a foreign document"
+        );
+        let storage = mock.storage();
+        let records = storage[ACTIVE_KEY].lines().collect::<Vec<_>>();
+        assert!(
+            records.contains(&"/one/src/main.rs"),
+            "the window root's record is not forgotten for a foreign edit"
+        );
     }
 
     #[test]
