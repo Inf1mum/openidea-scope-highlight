@@ -21,7 +21,13 @@ Built for [OpenIDEA](https://github.com/l0ng-ai/openidea) on the plugin API's
 
 - Presentation only: text, selection and undo history are never touched.
 - A scope clears when its document changes (a `document-changed`
-  subscription) and on the Clear command.
+  subscription) and on the Clear command. The host delivers change paths
+  project-relative, so the plugin resolves each event to one absolute
+  document — inside the invoking window's tree its project root decides; a
+  focused editor outside the tree is the changed document itself, since the
+  host relativizes against the file's own project — so two projects'
+  same-named files never cross-clear, and an event that pins to no document
+  is ignored (a stale range survives until a later edit or Clear).
 - Every open file keeps its own scope: split editors of different files stay
   independent (the API keys decoration sets by path, so two editors of the
   same file share one scope), and the two paint commands are only offered
